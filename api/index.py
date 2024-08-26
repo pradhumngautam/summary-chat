@@ -1,6 +1,6 @@
 import asyncio
 import uuid
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import JSONResponse
 import PyPDF2
 import docx
@@ -10,12 +10,14 @@ import os
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Dict
+from datetime import datetime
 
 # Load environment variables
 load_dotenv()
 
 app = FastAPI()
-
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,9 +27,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configure OpenAI API key
-
+# Configure Supabase client
 supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+
+# Configure OpenAI client
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
 @app.get("/health/{name}")
@@ -36,50 +40,13 @@ async def healthCheck(name: str):
         return JSONResponse(content={"detail": name})
     except Exception as e:
         print(e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/summarize")
 async def summarize(file: UploadFile = File(...)):
     try:
         contents = await file.read()
-
-        buckets = supabase.storage.list_buckets()
-        print(f"Available buckets: {[bucket.name for bucket in buckets]}")
-
-        file_id = str(uuid.uuid4())
-        file_path = f"{file_id}_{file.filename}"
-        print(f"Generated file path: {file_path}")
-
-        try:
-            result = supabase.storage.from_("documents").upload(file_path, contents)
-            print(f"File upload result: {result}")
-            print(f"Uploaded file path: {file_path}")
-        except Exception as e:
-            print(f"Error uploading file: {str(e)}")
-            return JSONResponse(
-                content={"error": f"Error uploading file: {str(e)}"}, status_code=500
-            )
-
-        await asyncio.sleep(2)  # Wait for 2 seconds
-
-        try:
-            public_url = supabase.storage.from_("documents").get_public_url(file_path)
-            print(f"Public URL: {public_url}")
-
-            signed_url = supabase.storage.from_("documents").create_signed_url(
-                file_path, 60
-            )
-            print(f"Signed URL: {signed_url}")
-
-            file_info = supabase.storage.from_("documents").get_public_url(file_path)
-            print(f"File info: {file_info}")
-
-            files = supabase.storage.from_("documents").list()
-            print(f"Files in documents bucket: {[file['name'] for file in files]}")
-        except Exception as e:
-            print(f"Error accessing file info: {str(e)}")
-
-        # Use the original contents instead of trying to download
         text = extract_text(contents, file.filename)
 
         # Truncate text if it's too long (approximate token limit)
@@ -90,7 +57,87 @@ async def summarize(file: UploadFile = File(...)):
         summary = generate_summary(text)
         return JSONResponse(content={"summary": summary})
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/start_chat")
+async def start_chat(file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+        file_path = f"documents/{uuid.uuid4()}_{file.filename}"
+
+        # Upload file to Supabase storage
+        supabase.storage.from_("documents").upload(file_path, contents)
+
+        session_id = str(uuid.uuid4())
+
+        # Insert new session into the database
+        supabase.table("chat_sessions").insert(
+            {"id": session_id, "file_path": file_path, "messages": []}
+        ).execute()
+
+        return JSONResponse(content={"session_id": session_id})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/chat/{session_id}")
+async def chat(session_id: str, message: str = Form(...)):
+    try:
+        # Fetch the session from the database
+        result = (
+            supabase.table("chat_sessions").select("*").eq("id", session_id).execute()
+        )
+        if not result.data:
+            raise HTTPException(status_code=400, detail="Invalid session ID")
+
+        session = result.data[0]
+
+        # Download file from Supabase
+        file_data = supabase.storage.from_("documents").download(session["file_path"])
+        text = extract_text(file_data, session["file_path"])
+
+        messages = session["messages"]
+        messages.append({"role": "user", "content": message})
+
+        response = generate_chat_response(text, messages)
+        messages.append({"role": "assistant", "content": response})
+
+        # Update the session in the database
+        supabase.table("chat_sessions").update(
+            {"messages": messages, "updated_at": datetime.utcnow().isoformat()}
+        ).eq("id", session_id).execute()
+
+        return JSONResponse(content={"response": response})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/end_chat/{session_id}")
+async def end_chat(session_id: str):
+    try:
+        result = (
+            supabase.table("chat_sessions").select("*").eq("id", session_id).execute()
+        )
+        if not result.data:
+            raise HTTPException(status_code=400, detail="Invalid session ID")
+
+        session = result.data[0]
+
+        # Delete file from Supabase storage
+        try:
+            supabase.storage.from_("documents").remove([session["file_path"]])
+        except Exception as e:
+            print(f"Error deleting file: {str(e)}")
+
+        # Delete session from the database
+        supabase.table("chat_sessions").delete().eq("id", session_id).execute()
+
+        return JSONResponse(
+            content={"message": "Chat session ended and file deleted successfully"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 def extract_text(contents: bytes, filename: str) -> str:
@@ -119,17 +166,34 @@ def extract_text_from_docx(contents: bytes) -> str:
 
 
 def generate_summary(text: str) -> str:
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    
-    response = client.chat.completions.create(
+    response = openai_client.chat.completions.create(
         model="gpt-4",
         messages=[
-            {"role": "system", "content": "You are a helpful assistant that summarizes text. Provide a concise summary of the main points."},
-            {"role": "user", "content": f"Summarize the following text:\n\n{text}"}
+            {
+                "role": "system",
+                "content": "You are a helpful assistant that summarizes text. Provide a concise summary of the main points.",
+            },
+            {"role": "user", "content": f"Summarize the following text:\n\n{text}"},
         ],
-        max_tokens=500
+        max_tokens=500,
     )
-    
+
+    return response.choices[0].message.content
+
+
+def generate_chat_response(context: str, messages: List[Dict[str, str]]) -> str:
+    system_message = {
+        "role": "system",
+        "content": "You are a helpful assistant that can answer questions about the given document.",
+    }
+    context_message = {"role": "system", "content": f"Context:\n\n{context}"}
+
+    all_messages = [system_message, context_message] + messages
+
+    response = openai_client.chat.completions.create(
+        model="gpt-4", messages=all_messages, max_tokens=500
+    )
+
     return response.choices[0].message.content
 
 
