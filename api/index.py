@@ -14,7 +14,6 @@ from pydantic import BaseModel
 from typing import List, Dict
 from datetime import datetime
 
-# Load environment variables
 load_dotenv()
 
 app = FastAPI()
